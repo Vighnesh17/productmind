@@ -1,0 +1,766 @@
+⏺ Step 0: Scope Challenge                                                                                                                
+                                                                                          
+  Existing code: None — pure greenfield. Nothing to reuse.                                                                               
+                                                                                                                                         
+  Scope assessment: This is a full-stack architecture design request. The three options are:                                             
+  1. SCOPE REDUCTION — Minimal local-only setup, defer all cloud architecture                                                            
+  2. BIG CHANGE — Full architecture: local stack → production stack, all layers designed                                                 
+  3. SMALL CHANGE — Architecture overview only, one pass, no deep per-section review                                                     
+
+  Given this is greenfield and the user explicitly asked for local→production phasing, BIG CHANGE is the right call. Proceeding with
+  that.
+
+  ---
+  ProductMind AI — Greenfield Architecture Plan
+
+  Managed Services Strategy
+
+  The core principle: your local environment and production environment use the same services, just different tiers. No "we use X locally
+   and Y in production" mismatches.
+
+  COMPONENT          LOCAL                        PRODUCTION
+  ────────────────────────────────────────────────────────────────────
+  Database           Supabase CLI (local Docker)  Supabase Cloud (managed PG)
+  Background Jobs    Inngest Dev Server           Inngest Cloud
+  Redis              Upstash (free tier)          Upstash (paid tier)
+  Vector DB          Pinecone (free tier)         Pinecone (paid tier)
+  Auth               Auth0 (dev tenant)           Auth0 (prod tenant)
+  Secrets            .env + Doppler CLI           Doppler (prod env)
+  Frontend           Next.js dev server           Vercel
+  Backend API        uvicorn (hot reload)         Cloud Run
+  Monitoring         Terminal logs                Better Stack
+  Storage            Supabase Storage (local)     Supabase Storage (cloud)
+
+  Key swap from original plan: Celery → Inngest.
+  Inngest is a managed background job service with a local dev server (inngest dev spins up a dashboard at localhost:8288). It
+  eliminates:
+  - The Celery + Redis broker complexity
+  - The Cloud Run cold-start / min-instances problem
+  - Manual retry/backoff implementation
+  - The need for a separate worker service
+
+  The API service calls Inngest to enqueue work. Inngest calls back to the API via HTTP. Local and cloud work identically.
+
+  ---
+  Section 1: Architecture Review
+
+  Full System Architecture
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                          LOCAL DEVELOPMENT                               │
+  │                                                                          │
+  │  ┌──────────────┐   ┌──────────────┐   ┌──────────────────────────┐    │
+  │  │  Next.js 15   │   │  FastAPI     │   │   Inngest Dev Server      │    │
+  │  │  :3000        │   │  :8000       │   │   :8288 (dashboard UI)    │    │
+  │  │  (npm dev)    │   │  (uvicorn)   │   │                           │    │
+  │  └──────┬───────┘   └──────┬───────┘   └──────────────────────────┘    │
+  │         │                  │                        ▲                    │
+  │         │ HTTP + SSE       │ Inngest SDK            │ HTTP callback      │
+  │         └──────────────────┘                        │                   │
+  │                  │                                   │                   │
+  │         ┌────────▼───────────────────────────────────────────────┐      │
+  │         │                   supabase start                         │      │
+  │         │  Postgres :5432  ·  Auth :54321  ·  Storage :54323      │      │
+  │         └────────────────────────────────────────────────────────┘      │
+  │                                                                          │
+  │  External (same services as prod, just dev tier):                        │
+  │  · Pinecone free tier  · Upstash free tier  · Auth0 dev tenant           │
+  │  · Anthropic API (real)  · Doppler CLI (local env vars)                  │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │                          PRODUCTION                                       │
+  │                                                                          │
+  │  ┌──────────────┐   ┌─────────────────────────────────────────────┐    │
+  │  │    Vercel     │   │              Cloud Run (API)                 │    │
+  │  │  (Next.js)   │   │   FastAPI · min=0 · max=20 · 1Gi RAM        │    │
+  │  └──────┬───────┘   └──────────────────────┬────────────────────--┘    │
+  │         │                                   │                            │
+  │         │  HTTPS + JWT                      │ Inngest SDK (enqueue)     │
+  │         └───────────────────────────────────┘                           │
+  │                          │                                               │
+  │              ┌───────────▼──────────┐                                   │
+  │              │    Auth0 (JWT)        │                                   │
+  │              │  tenant_id in claims  │                                   │
+  │              └───────────┬──────────┘                                   │
+  │                          │                                               │
+  │  ┌───────────────────────▼────────────────────────────────────────┐    │
+  │  │                    Inngest Cloud                                  │    │
+  │  │  · Managed job queue  · Retries/backoff  · Full observability   │    │
+  │  │  · Calls back to Cloud Run API via HTTP                          │    │
+  │  └───────────────────────┬────────────────────────────────────────┘    │
+  │                          │                                               │
+  │         ┌────────────────┼────────────────┐                            │
+  │         │                │                │                             │
+  │  ┌──────▼──────┐  ┌──────▼──────┐  ┌─────▼──────┐  ┌──────────────┐  │
+  │  │  Supabase   │  │  Pinecone   │  │  Upstash   │  │    Doppler   │  │
+  │  │  (Postgres  │  │  (Vectors)  │  │  (Redis)   │  │  (Secrets)   │  │
+  │  │   + RLS)    │  │             │  │            │  │              │  │
+  │  └─────────────┘  └─────────────┘  └────────────┘  └──────────────┘  │
+  │                                                                          │
+  │  Monitoring: Better Stack (logs + alerts + uptime)                       │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  Agent Execution Flow
+
+  PM sends message
+        │
+        ▼
+  POST /api/v1/agent/{id}/message
+        │
+        ├─── Auth0 JWT validation
+        ├─── Tenant scoping (tenant_id from JWT, never from body)
+        ├─── Budget check (Upstash Redis counter)
+        │    └─ Over budget → 429 immediately
+        │
+        ├─── Persist message to Supabase (conversations.messages)
+        ├─── Enqueue Inngest job: "agent/execute"
+        │
+        └─── Return: { task_id, status: "queued" }
+                     + open SSE channel for streaming updates
+
+  Inngest receives job
+        │
+        ▼
+  agent/execute function
+        │
+        ├─── Load conversation history (Supabase)
+        ├─── Recall relevant context (Pinecone semantic search)
+        │    └─ Timeout → continue with empty context, log metric
+        │
+        ├─── Fetch OAuth tokens (Doppler / Secret Manager)
+        │
+        ├─── Claude API call (streaming, tool_use enabled)
+        │    │
+        │    └─── Tool use loop:
+        │         ├─── Validate tool name (registry lookup)
+        │         ├─── Validate params (Pydantic)
+        │         ├─── Execute tool (Jira/Slack API)
+        │         └─── Return result to Claude
+        │
+        ├─── Stream chunks to SSE via Upstash Redis pub/sub
+        │
+        ├─── Persist: final message to Supabase (source of truth)
+        ├─── Upsert: embeddings to Pinecone (async, non-blocking)
+        └─── Decrement: token budget in Upstash Redis
+
+  Agent Executor State Machine
+
+                      ┌──────────┐
+                      │  QUEUED  │ ◄─── Inngest job received
+                      └────┬─────┘
+                           │
+                           ▼
+                      ┌──────────┐
+                      │ CONTEXT  │ ◄─── Pinecone recall
+                      │ LOADING  │      Timeout → DEGRADED (continues)
+                      └────┬─────┘
+                           │
+                           ▼
+                ┌──────────────────────┐
+                │     LLM CALLING      │ ◄─── Claude tool_use
+                │  (streaming tokens   │      Timeout → RETRY (2x)
+                │   to SSE via Redis)  │      Rate limit → RETRY (backoff)
+                └──────┬───────────────┘      Exhausted → FAILED
+                       │
+                ┌──────▼───────────────┐
+                │   TOOL EXECUTING     │ ◄─── Jira/Slack API calls
+                │  (loop until no      │      Unknown tool → log, skip
+                │   more tool_use)     │      API error → inform Claude
+                └──────┬───────────────┘
+                       │ final response
+                       ▼
+                      ┌──────────┐
+                      │PERSISTING│ ◄─── Supabase write (must succeed)
+                      └────┬─────┘      Pinecone write (best-effort)
+                           │
+                           ▼
+                      ┌──────────┐
+                      │COMPLETED │ ──── SSE "done" event sent
+                      └──────────┘
+
+    FAILED state: SSE "error" event sent, message saved with error status
+    Impossible: COMPLETED → any state (terminal)
+    Impossible: QUEUED → TOOL_EXECUTING (must go through LLM first)
+
+  Database Schema
+
+  tenants
+    id            uuid PK
+    name          text
+    slug          text UNIQUE
+    created_at    timestamptz
+
+  users
+    id            uuid PK
+    tenant_id     uuid FK → tenants
+    auth0_id      text UNIQUE
+    role          text             -- admin | member
+    created_at    timestamptz
+
+  agents
+    id            uuid PK
+    tenant_id     uuid FK → tenants
+    name          text
+    team_profile  jsonb            -- learned team context
+    created_at    timestamptz
+
+  conversations
+    id            uuid PK
+    tenant_id     uuid FK → tenants
+    agent_id      uuid FK → agents
+    created_at    timestamptz
+
+  messages
+    id            uuid PK
+    tenant_id     uuid FK → tenants  -- denormalized for RLS
+    conversation_id uuid FK
+    role          text             -- user | assistant
+    content       text
+    sources       jsonb            -- [{tool, id, url, timestamp}]
+    token_usage   jsonb            -- {input, output, model}
+    accuracy_flag text             -- null | wrong_status | missing_context | ...
+    created_at    timestamptz
+
+  integration_configs
+    id            uuid PK
+    tenant_id     uuid FK → tenants
+    provider      text             -- jira | slack | notion
+    workspace_id  text
+    config        jsonb            -- {base_url, channel_ids, project_keys, ...}
+    secret_ref    text             -- Doppler secret path (never store tokens here)
+    status        text             -- active | expired | error
+    created_at    timestamptz
+
+  workflow_configs
+    id              uuid PK
+    tenant_id       uuid FK → tenants
+    agent_id        uuid FK → agents
+    workflow_name   text             -- sprint_status | standup_summary | ...
+    mode            text             -- watch | draft | act
+    admin_max_mode  text             -- watch | draft | act (ceiling set by admin)
+    config          jsonb            -- schedule, target_channel, template_id, etc.
+    updated_by      uuid FK → users
+    updated_at      timestamptz
+    UNIQUE (agent_id, workflow_name)
+  -- Permission check: workflow_config.mode, never tenant.trust_level
+
+  token_usage_daily
+    id            uuid PK
+    tenant_id     uuid FK → tenants
+    date          date
+    tokens_used   int DEFAULT 0
+    budget_limit  int DEFAULT 100000
+    UNIQUE (tenant_id, date)
+
+  RLS policies (applied to every tenant-scoped table):
+  -- Example: messages table
+  ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
+
+  CREATE POLICY tenant_isolation ON messages
+    USING (tenant_id = (current_setting('app.current_tenant_id'))::uuid);
+
+  The FastAPI middleware sets app.current_tenant_id from the JWT before every query. tenant_id is never accepted from request body.
+
+  ---
+  Architecture Issues
+
+  Issue 1 — OK: Inngest replaces Celery. No worker service to deploy. No Redis broker to manage. Inngest handles retries, backoff,
+  idempotency, and observability. The API service is the only backend service. Cloud Run min-instances problem from the CEO review is
+  eliminated entirely.
+
+  Issue 2 — OK: Supabase local CLI for dev. supabase start spins up Postgres, Auth, and Storage locally via Docker with the exact same
+  RLS policies as production. Zero configuration drift between environments.
+
+  Issue 3 — WARNING: SSE streaming via Redis pub/sub. Inngest calls back to the API via HTTP (webhook pattern). The API needs to forward
+  streaming chunks to the browser SSE connection. Since Cloud Run instances are stateless (different instance may receive the Inngest
+  callback vs. the one holding the SSE connection), chunks must route through Upstash Redis pub/sub. Each SSE connection subscribes to a
+  task:{task_id} channel.
+
+  Browser SSE ←── FastAPI instance A ←── Redis sub("task:abc")
+                                                ▲
+  Inngest callback ──► FastAPI instance B ──── Redis pub("task:abc", chunk)
+
+  This works correctly but must be explicit in the implementation.
+
+  Issue 4 — WARNING: Doppler for secrets. Using Doppler instead of GCP Secret Manager gives identical developer experience locally and in
+   production (doppler run -- uvicorn ...). No .env files committed. Every engineer pulls from Doppler automatically. Doppler syncs to
+  GCP Secret Manager in production if needed, or Cloud Run can pull from Doppler directly via the Doppler CLI in the Docker image.
+
+  ---
+  Section 2: Code Quality
+
+  Project Structure
+
+  pm-saas/
+  ├── backend/
+  │   ├── api/
+  │   │   ├── main.py              # FastAPI app factory
+  │   │   ├── deps.py              # Shared FastAPI dependencies
+  │   │   ├── middleware/
+  │   │   │   ├── auth.py          # Auth0 JWT → request.state.tenant_id
+  │   │   │   └── budget.py        # Token budget check (Upstash Redis)
+  │   │   └── routes/
+  │   │       ├── agents.py        # CRUD + message endpoint
+  │   │       ├── integrations.py  # OAuth setup, health
+  │   │       └── stream.py        # SSE endpoint (Redis sub)
+  │   │
+  │   ├── agents/
+  │   │   └── pm/
+  │   │       ├── agent.py         # Orchestrator: context → LLM → tools → persist
+  │   │       ├── prompts/
+  │   │       │   └── system.md    # System prompt (versioned, never inline)
+  │   │       └── workflows/
+  │   │           └── sprint_status.py  # Phase 1 workflow
+  │   │
+  │   ├── tools/
+  │   │   ├── base.py              # BaseTool: schema + execute interface
+  │   │   ├── registry.py          # Tool registry: name → BaseTool
+  │   │   ├── jira/
+  │   │   │   ├── client.py        # Jira HTTP client (httpx, retry built-in)
+  │   │   │   ├── schema.py        # Pydantic models for Jira API responses
+  │   │   │   └── tools.py         # list_issues, get_issue (Phase 1)
+  │   │   └── slack/
+  │   │       ├── client.py
+  │   │       ├── schema.py
+  │   │       └── tools.py         # read_channel, search_messages (Phase 1)
+  │   │
+  │   ├── memory/
+  │   │   └── store.py             # remember(msg) → Pinecone, recall(query) → chunks
+  │   │
+  │   ├── jobs/
+  │   │   └── agent_task.py        # Inngest function: agent/execute
+  │   │
+  │   ├── models/                  # SQLAlchemy ORM models
+  │   │   ├── base.py              # TenantMixin, TimestampMixin
+  │   │   ├── tenant.py
+  │   │   ├── agent.py
+  │   │   ├── conversation.py
+  │   │   └── integration.py
+  │   │
+  │   ├── db/
+  │   │   ├── session.py           # Async SQLAlchemy session factory
+  │   │   └── rls.py               # set_tenant_context() helper
+  │   │
+  │   ├── config.py                # Pydantic Settings (from env/Doppler)
+  │   └── tests/
+  │       ├── conftest.py          # DB fixtures, tenant fixtures
+  │       ├── test_rls.py          # Cross-tenant isolation (mandatory)
+  │       ├── test_agent.py        # Agent loop unit tests
+  │       ├── test_tools_jira.py   # Jira tool contract tests
+  │       ├── test_tools_slack.py
+  │       └── evals/
+  │           └── sprint_status.py # LLM behavioral evals
+  │
+  ├── frontend/
+  │   ├── app/
+  │   │   ├── (auth)/              # Login, signup pages
+  │   │   ├── dashboard/           # Main PM view
+  │   │   └── setup/               # Integration OAuth flow
+  │   ├── components/
+  │   │   ├── agent-chat.tsx       # SSE streaming chat
+  │   │   ├── sprint-report.tsx    # Structured report view
+  │   │   └── source-citation.tsx  # Citation display
+  │   └── lib/
+  │       ├── api.ts               # API client
+  │       └── auth.ts              # Auth0 React SDK
+  │
+  ├── supabase/
+  │   ├── migrations/              # SQL migrations (supabase migration new)
+  │   └── seed.sql                 # Dev seed data
+  │
+  ├── infra/
+  │   └── terraform/
+  │       ├── main.tf
+  │       ├── cloudrun.tf
+  │       └── variables.tf
+  │
+  ├── .env.example                 # Every var documented, no values
+  ├── docker-compose.yml           # Supabase local (supabase start wraps this)
+  └── Claude.md
+
+  Required Code Patterns
+
+  1. Tool Registry pattern (tools/registry.py):
+  # All tools registered at startup. Agent loop validates tool names here.
+  # Unknown tool name → ToolNotFoundError immediately, never reaches Claude.
+  REGISTRY: dict[str, BaseTool] = {}
+
+  def register(tool: BaseTool) -> None:
+      REGISTRY[tool.name] = tool
+
+  def get(name: str) -> BaseTool:
+      if name not in REGISTRY:
+          raise ToolNotFoundError(f"Unknown tool: {name}")
+      return REGISTRY[name]
+
+  2. All prompts in markdown files, never inline:
+  # agents/pm/agent.py
+  SYSTEM_PROMPT = Path("agents/pm/prompts/system.md").read_text()
+  # Never: system_prompt = "You are a PM agent that..."
+
+  3. tenant_id always from JWT, set via db context:
+  # db/rls.py
+  async def set_tenant_context(session: AsyncSession, tenant_id: str) -> None:
+      await session.execute(
+          text("SELECT set_config('app.current_tenant_id', :tid, true)"),
+          {"tid": tenant_id}
+      )
+  # This is called in every request before any DB query.
+  # tenant_id is NEVER accepted from request body or path params.
+
+  4. Structured logging — every log has context:
+  import structlog
+  log = structlog.get_logger()
+
+  # Always bind context at the top of each function:
+  log = log.bind(tenant_id=tenant_id, agent_id=agent_id, task_id=task_id)
+  log.info("agent.tool.executed", tool=tool_name, latency_ms=elapsed, success=True)
+
+  5. Config from Pydantic Settings (Doppler → env vars → config):
+  # config.py
+  class Settings(BaseSettings):
+      anthropic_api_key: str
+      supabase_url: str
+      supabase_anon_key: str
+      pinecone_api_key: str
+      upstash_redis_url: str
+      auth0_domain: str
+      auth0_audience: str
+      inngest_signing_key: str
+      doppler_token: str | None = None  # Optional, used by CLI
+
+      model_config = SettingsConfigDict(env_file=".env")
+
+  settings = Settings()
+
+  ---
+  Section 3: Test Review
+
+  New Things Introduced (Phase 1)
+
+  NEW UX FLOWS:
+    · Auth0 login → dashboard
+    · Integration OAuth setup (Jira, Slack)
+    · Agent conversation (send message → SSE stream → rendered report)
+    · Source citation display
+    · "Flag as inaccurate" correction flow
+
+  NEW DATA FLOWS:
+    · Message → Supabase persist → Inngest enqueue
+    · Inngest → agent executor → Claude tool_use loop
+    · Claude tool_use → Tool registry → Jira/Slack API → result to Claude
+    · Agent output → Supabase persist (source of truth)
+    · Agent output → Pinecone upsert (async, best-effort)
+    · Streaming chunks → Upstash Redis pub/sub → SSE to browser
+
+  NEW CODEPATHS:
+    · JWT validation + tenant_id extraction
+    · Budget check (Upstash Redis counter)
+    · RLS context injection (set_tenant_context)
+    · Tool registry lookup (valid name → execute, invalid → error)
+    · Agent loop: context load → LLM → tool execute → loop
+    · Pinecone recall + upsert
+    · SSE stream subscribe/publish
+
+  NEW BACKGROUND JOBS:
+    · agent/execute (Inngest) — full agent loop
+
+  NEW INTEGRATIONS:
+    · Anthropic Claude API (streaming, tool_use)
+    · Jira REST API v3 (OAuth, read-only)
+    · Slack Web API (OAuth, read-only)
+    · Pinecone (upsert + query)
+    · Upstash Redis (counter + pub/sub)
+    · Inngest (enqueue + webhook callback)
+    · Auth0 (JWT validation)
+
+  Test Requirements
+
+  TEST                              TYPE          KEY ASSERTIONS
+  ──────────────────────────────────────────────────────────────────────────────
+  test_cross_tenant_isolation       Integration   Tenant A cannot read tenant B's
+                                                 messages, agents, integrations.
+                                                 Assert zero rows, no error.
+
+  test_budget_enforcement           Unit          Over-budget request → 429 before
+                                                 any LLM call is made.
+
+  test_rls_tenant_id_from_jwt       Unit          Request with tenant_id in body
+                                                 is ignored. Only JWT tenant_id used.
+
+  test_tool_registry_unknown_tool   Unit          Hallucinated tool name →
+                                                 ToolNotFoundError, not 500.
+
+  test_agent_loop_jira_timeout      Integration   Jira API timeout → agent continues,
+                                                 informs Claude, produces partial
+                                                 response with confidence note.
+
+  test_pinecone_fail_nonfatal       Integration   Pinecone upsert fails →
+                                                 Supabase write still succeeds,
+                                                 message persisted, metric logged.
+
+  test_sse_stream_task_id           Integration   SSE channel receives all chunks
+                                                 for task_id, final "done" event.
+
+  test_sprint_status_report_format  Unit          Output matches expected schema:
+                                                 status, highlights, risks, blockers,
+                                                 confidence, sources.
+
+  test_correction_flag              Integration   PM flags message as inaccurate →
+                                                 accuracy_flag persisted, not 500.
+
+  evals/sprint_status.py            Eval          5 real sprint scenarios.
+                                                 Agent produces accurate status +
+                                                 risk assessment for each.
+                                                 Runs on every prompt change.
+                                                 Fails CI if accuracy < 80%.
+
+  Friday 2am test:
+  async def test_full_sprint_status_e2e():
+      """
+      Full round-trip: PM sends message → Jira + Slack read →
+      Claude reasons → response persisted → SSE received.
+      Uses recorded Jira/Slack fixtures (not live API).
+      """
+
+  Chaos test:
+  async def test_inngest_callback_to_different_instance():
+      """
+      SSE subscriber on instance A. Inngest callback hits instance B.
+      Assert: chunks still delivered via Redis pub/sub.
+      """
+
+  ---
+  Section 4: Performance Review
+
+  ┌──────────────────────────────┬───────┬───────┬────────────────────────────────────────────────┐
+  │           Codepath           │  p50  │  p99  │                Action Required                 │
+  ├──────────────────────────────┼───────┼───────┼────────────────────────────────────────────────┤
+  │ Claude Haiku sprint status   │ 1s    │ 5s    │ SSE streaming from first token                 │
+  ├──────────────────────────────┼───────┼───────┼────────────────────────────────────────────────┤
+  │ Claude Sonnet sprint status  │ 3s    │ 12s   │ SSE streaming + progress indicators            │
+  ├──────────────────────────────┼───────┼───────┼────────────────────────────────────────────────┤
+  │ Jira API (10 tickets)        │ 400ms │ 2s    │ 10s timeout, cache results in Redis (5min TTL) │
+  ├──────────────────────────────┼───────┼───────┼────────────────────────────────────────────────┤
+  │ Slack channel read (30 days) │ 600ms │ 3s    │ Cache in Redis (15min TTL)                     │
+  ├──────────────────────────────┼───────┼───────┼────────────────────────────────────────────────┤
+  │ Pinecone recall (k=10)       │ 80ms  │ 300ms │ Acceptable, non-blocking                       │
+  ├──────────────────────────────┼───────┼───────┼────────────────────────────────────────────────┤
+  │ Budget check (Redis)         │ 5ms   │ 20ms  │ Acceptable, fast path                          │
+  ├──────────────────────────────┼───────┼───────┼────────────────────────────────────────────────┤
+  │ RLS context set              │ 1ms   │ 5ms   │ Acceptable                                     │
+  └──────────────────────────────┴───────┴───────┴────────────────────────────────────────────────┘
+
+  N+1 risk: When loading conversation history, eager-load messages with the conversation. Never for msg in conversation.messages without
+  preloading.
+
+  Caching strategy (Upstash Redis):
+  jira:sprint:{tenant_id}:{sprint_id}      TTL: 5min
+  jira:ticket:{tenant_id}:{ticket_id}      TTL: 5min
+  slack:channel:{tenant_id}:{channel_id}   TTL: 15min
+  budget:{tenant_id}:{date}                TTL: until midnight (rolling)
+
+  Memory concern: Slack channel history for 30 days can be large. Fetch in pages, summarise progressively, never load all messages into
+  memory at once.
+
+  ---
+  Failure Modes Registry
+
+  CODEPATH                   | FAILURE                  | TEST? | HANDLED? | USER SEES?
+  ──────────────────────────────────────────────────────────────────────────────────────
+  JWT validation             | Invalid/expired token     | YES   | YES      | 401
+  Budget check               | Redis unavailable         | NO    | NO       | ← GAP*
+  Tool registry lookup       | Hallucinated tool name    | YES   | YES      | Agent retries
+  Jira API call              | Token expired (401)       | YES   | YES      | Re-auth prompt
+  Jira API call              | Rate limit (429)          | YES   | YES      | Transparent retry
+  Jira API call              | Timeout                   | YES   | YES      | Agent continues degraded
+  Claude API call            | Rate limit                | YES   | YES      | Transparent backoff
+  Claude API call            | Timeout                   | YES   | YES      | "AI timed out, retry"
+  Claude API call            | Empty response            | NO    | NO       | ← CRITICAL GAP
+  Pinecone upsert            | Connection fail           | YES   | YES      | Transparent (non-fatal)
+  Pinecone recall            | Timeout                   | YES   | YES      | Continues without context
+  Supabase write (message)   | Connection fail           | NO    | NO       | ← CRITICAL GAP
+  SSE pub/sub                | Redis pub/sub fail        | NO    | NO       | ← CRITICAL GAP
+  Inngest webhook            | Callback to wrong instance| YES   | YES (Redis)| Transparent
+  OAuth token fetch          | Doppler unavailable       | NO    | NO       | ← CRITICAL GAP
+
+  CRITICAL GAPs requiring fixes before Phase 1 ships:
+
+  1. Claude empty response: Add explicit check after streaming. If response has no content blocks → retry once with "please provide a
+  response" → if still empty → AgentRefusalError → user sees "AI gave no response, please retry."
+  2. Supabase write failure: Wrap in try/except sqlalchemy.exc.OperationalError. Retry once (100ms delay). If still failing → Inngest
+  marks job as failed → requeue. User sees loading state until resolved.
+  3. SSE Redis pub/sub failure: If Redis pub/sub channel can't be established → fall back to polling (GET /api/v1/task/{id}/status).
+  Frontend should implement polling fallback automatically after 5s with no SSE events.
+  4. Budget check when Redis is unavailable: Fail open (allow the request) and log budget.check.unavailable metric. Revenue > budget
+  enforcement during an outage.
+  5. Doppler/OAuth token unavailable: Agent task fails immediately with IntegrationAuthError. User sees "Your Jira connection is
+  unavailable — please reconnect." This must not silently produce an empty sprint report.
+
+  ---
+  Local → Production Phasing
+
+  Local Dev Commands (Day 1 setup)
+
+  # 1. Install tools
+  brew install supabase/tap/supabase doppler inngest
+
+  # 2. Start local Supabase
+  supabase start
+  # → Postgres at localhost:5432
+  # → Studio at localhost:54323
+
+  # 3. Run migrations
+  supabase db push
+
+  # 4. Start Inngest dev server
+  inngest dev
+  # → Dashboard at localhost:8288
+
+  # 5. Pull secrets from Doppler
+  doppler setup  # links to your Doppler project
+
+  # 6. Start backend
+  doppler run -- uvicorn backend.api.main:app --reload --port 8000
+
+  # 7. Start frontend
+  cd frontend && npm run dev
+  # → localhost:3000
+
+  One terminal per service. No docker-compose required for day-to-day dev. supabase start handles the Postgres container internally.
+
+  Production Deploy (Cloud Run + Vercel)
+
+  DEPLOY SEQUENCE:
+    Step 1: Push Supabase migrations
+            supabase db push --linked
+            → verify RLS policies active
+
+    Step 2: Build and push Docker image (API only — no worker)
+            docker build -f Dockerfile -t gcr.io/{project}/api:{sha} .
+            docker push gcr.io/{project}/api:{sha}
+
+    Step 3: Deploy Cloud Run
+            gcloud run deploy productmind-api \
+              --image gcr.io/{project}/api:{sha} \
+              --set-secrets=... (from Doppler or GCP Secret Manager)
+            → smoke: GET /health → 200
+
+    Step 4: Register Inngest functions (automatic on first request)
+            curl https://api.productmind.ai/api/inngest
+            → Inngest discovers and registers all functions
+
+    Step 5: Deploy frontend
+            vercel --prod
+            → smoke: load page, verify auth flow
+
+    Step 6: E2E smoke test
+            → Login → create agent → connect Jira test account → sprint status report
+
+  Rollback:
+  - API: Cloud Run revisions → route 100% traffic to previous revision (<2 min)
+  - Frontend: Vercel → Deployments → instant rollback (<1 min)
+  - Database: All Phase 1 migrations are additive (no drops, no renames) → no migration rollback needed
+
+  ---
+  NOT In Scope
+
+  ┌────────────────────────────┬───────────────────────────────────────────────────────────────┐
+  │            Item            │                           Rationale                           │
+  ├────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ Notion integration         │ Phase 2 — Jira + Slack must pass quality gates first          │
+  ├────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ L2+ trust levels           │ Phase 2 — L1 must be outrageously valuable first              │
+  ├────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ Multi-tenant (>1 customer) │ Phase 2 — validate with internal team first                   │
+  ├────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ GitHub integration         │ Phase 3                                                       │
+  ├────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ Cross-tenant analytics     │ Phase 3                                                       │
+  ├────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ SOC2                       │ Phase 2 prep, Phase 3 certification                           │
+  ├────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ Admin dashboard            │ Phase 2                                                       │
+  ├────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ Neo4j                      │ Deferred indefinitely — Supabase JSONB covers Phase 1-2 needs │
+  ├────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ Custom agent framework     │ Replaced by thin tool_use orchestration layer                 │
+  └────────────────────────────┴───────────────────────────────────────────────────────────────┘
+
+  ---
+  What Already Exists
+
+  Nothing. Greenfield. No existing code.
+
+  ---
+  TODOS.md — Items to Track
+
+  TODO 1 — Inngest Python SDK maturity check
+  - What: Validate inngest-py SDK supports streaming callbacks and is production-stable.
+  - Why: The entire background job architecture depends on this. If the Python SDK is immature, need to fall back to Celery.
+  - Effort: S | Priority: P1 | Do before: writing jobs/agent_task.py
+
+  TODO 2 — SSE polling fallback
+  - What: Frontend falls back to polling if SSE/Redis pub/sub fails.
+  - Why: Cloud Run can drop SSE connections. Redis pub/sub has edge cases with subscription timing.
+  - Effort: S | Priority: P1 | Blocked by: SSE implementation
+
+  TODO 3 — Supabase RLS automated test in CI
+  - What: test_cross_tenant_isolation must run in CI on every commit, against local Supabase.
+  - Why: RLS bugs are silent — they produce empty results, not errors. Only tests catch them.
+  - Effort: S | Priority: P1 | Blocked by: Supabase local setup
+
+  TODO 4 — Doppler → GCP Secret Manager sync
+  - What: Decide whether Cloud Run pulls secrets from Doppler directly or from GCP Secret Manager (Doppler can sync to it).
+  - Why: If Cloud Run can't reach Doppler on startup, the service won't start. GCP Secret Manager is more reliable within GCP.
+  - Effort: S | Priority: P2 | Blocked by: Cloud Run deploy
+
+  TODO 5 — Jira/Slack response caching layer
+  - What: Cache Jira sprint data and Slack messages in Upstash Redis with TTLs.
+  - Why: Without caching, every agent task hits Jira/Slack APIs. At 10 messages/hour per tenant, this exhausts rate limits quickly.
+  - Effort: M | Priority: P2 | Blocked by: Basic tool integration working
+
+  TODO 6 — LLM eval suite in CI
+  - What: evals/sprint_status.py runs on every prompt file change (detected by git diff path filter).
+  - Why: Prompt changes that break accuracy won't be caught by unit tests.
+  - Effort: M | Priority: P1 | Blocked by: First prompt shipped
+
+  ---
+  Completion Summary
+
+  +====================================================================+
+  |         PRODUCTMIND AI — ENG ARCHITECTURE REVIEW SUMMARY           |
+  +====================================================================+
+  | Step 0           | BIG CHANGE — full greenfield architecture        |
+  | Scope            | Phase 1 Walking Skeleton: Jira + Slack + Sprint  |
+  |                  | Status Report. Local → Production phased.        |
+  +--------------------------------------------------------------------+
+  | Architecture     | 4 items (2 warnings, 2 OK)                      |
+  |                  | Key decision: Celery → Inngest (managed jobs)    |
+  |                  | Key decision: Doppler for secrets (local parity) |
+  | Code Quality     | 5 required patterns defined                      |
+  |                  | Project structure fully mapped                   |
+  | Tests            | 10 test specs defined + eval suite              |
+  |                  | Mandatory: RLS test in CI, eval on prompt change |
+  | Performance      | Caching strategy defined for Jira/Slack          |
+  |                  | SSE streaming mandatory from day 1               |
+  +--------------------------------------------------------------------+
+  | NOT in scope     | 8 items with rationale                          |
+  | What exists      | Nothing — greenfield                            |
+  | TODOS.md         | 6 items                                         |
+  | Failure modes    | 14 mapped, 5 CRITICAL GAPS (fixes specified)    |
+  | Diagrams         | System arch, agent flow, state machine, schema, |
+  |                  | local dev commands, deploy sequence             |
+  +====================================================================+
+
+  UNRESOLVED DECISIONS (answer before first line of code):
+    1. Inngest Python SDK — validate maturity before committing to it
+    2. Doppler vs GCP Secret Manager for Cloud Run secrets
+    3. Supabase Auth vs Auth0 — Supabase Auth covers L1 needs at
+       lower complexity; Auth0 only needed when SAML SSO is required
+  +====================================================================+
+
+  The three unresolved decisions at the bottom are the only things that block starting. Everything else is defined enough to write code
+  from.
