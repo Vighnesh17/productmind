@@ -282,7 +282,20 @@
                                                 ▲
   Inngest callback ──► FastAPI instance B ──── Redis pub("task:abc", chunk)
 
-  This works correctly but must be explicit in the implementation.
+  RACE CONDITION — must be explicitly handled:
+  If Inngest starts publishing chunks before the browser's SSE connection has
+  subscribed to the Redis channel, those chunks are silently dropped.
+
+  FIX — two-part:
+    1. Subscriber-ready signal:
+       POST /agent/message → persists task in DB with status="pending_subscriber"
+       SSE connect → sets Redis key "task:{id}:ready" = 1, then subscribes
+       Inngest function polls for "task:{id}:ready" key (max 5s) before streaming
+
+    2. Frontend polling fallback:
+       If SSE receives no events within 5s of task creation, switch to polling
+       GET /api/v1/task/{id}/status until status = completed | failed
+       (see TODO 2 — SSE polling fallback)
 
   Issue 4 — WARNING: Doppler for secrets. Using Doppler instead of GCP Secret Manager gives identical developer experience locally and in
    production (doppler run -- uvicorn ...). No .env files committed. Every engineer pulls from Doppler automatically. Doppler syncs to
@@ -423,7 +436,7 @@
   class Settings(BaseSettings):
       anthropic_api_key: str
       supabase_url: str
-      supabase_anon_key: str
+      supabase_service_role_key: str   # backend only — never expose to browser
       pinecone_api_key: str
       upstash_redis_url: str
       auth0_domain: str
@@ -672,7 +685,7 @@
   ├────────────────────────────┼───────────────────────────────────────────────────────────────┤
   │ Notion integration         │ Phase 2 — Jira + Slack must pass quality gates first          │
   ├────────────────────────────┼───────────────────────────────────────────────────────────────┤
-  │ L2+ trust levels           │ Phase 2 — L1 must be outrageously valuable first              │
+  │ ACT mode for any workflow   │ Phase 2 — WATCH/DRAFT must prove value first                  │
   ├────────────────────────────┼───────────────────────────────────────────────────────────────┤
   │ Multi-tenant (>1 customer) │ Phase 2 — validate with internal team first                   │
   ├────────────────────────────┼───────────────────────────────────────────────────────────────┤
